@@ -1,6 +1,6 @@
 import json
 import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers import AutoTokenizer, AutoModel
 from datasets import Dataset
 from sklearn.model_selection import train_test_split
 from peft import LoraConfig, get_peft_model
@@ -24,10 +24,13 @@ train_dataset = Dataset.from_dict({'text': train_texts, 'emotion': train_emotion
 test_dataset = Dataset.from_dict({'text': test_texts, 'emotion': test_emotions, 'fulfilled': test_fulfilled, 'type': test_types})
 
 # 加载预训练模型和tokenizer
-model_name = 'BAAI/bge-large'
+model_name = '/root/ELSE/huggingface/models/bge-large-zh-v1.5'
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=16).to(device)
+print(device)
+
+# 只加载backbone，不带分类头
+backbone = AutoModel.from_pretrained(model_name).to(device)
 
 # 配置LoRA
 lora_config = LoraConfig(
@@ -38,8 +41,39 @@ lora_config = LoraConfig(
     bias='none',
     task_type='SEQ_CLS'
 )
-# 会 return PeftModelForSequenceClassification
-model = get_peft_model(model, lora_config)
+backbone = get_peft_model(backbone, lora_config)
+backbone.print_trainable_parameters()
+
+# 定义多任务分类头
+class MultiTaskHead(torch.nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.emotion_head = torch.nn.Linear(hidden_size, 4)      # 4分类
+        self.fulfilled_head = torch.nn.Linear(hidden_size, 1)    # 2分类（用BCE）
+        self.type_head = torch.nn.Linear(hidden_size, 11)        # 11分类
+    def forward(self, pooled):
+        emotion_logits = self.emotion_head(pooled)
+        fulfilled_logits = self.fulfilled_head(pooled).view(-1)
+        type_logits = self.type_head(pooled)
+        return emotion_logits, fulfilled_logits, type_logits
+
+# 定义完整模型
+class MultiTaskModel(torch.nn.Module):
+    def __init__(self, backbone, hidden_size):
+        super().__init__()
+        self.backbone = backbone
+        self.heads = MultiTaskHead(hidden_size)
+    def forward(self, input_ids, attention_mask):
+        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+        # 取CLS token
+        if hasattr(outputs, 'last_hidden_state'):
+            pooled = outputs.last_hidden_state[:, 0]
+        else:
+            pooled = outputs[0][:, 0]
+        return self.heads(pooled)
+
+hidden_size = backbone.config.hidden_size
+model = MultiTaskModel(backbone, hidden_size).to(device)
 
 # 训练设置
 optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
@@ -54,10 +88,8 @@ test_dataset = test_dataset.map(preprocess_function, batched=True)
 
 # 定义collate_fn函数
 def collate_fn(batch):
-    # 将batch中的每个item转换为tensor，并堆叠在一起
     return {
         'input_ids': torch.stack([torch.tensor(item['input_ids']).to(device) for item in batch]),
-        # 将batch中的每个item的attention_mask转换为tensor，并堆叠在一起
         'attention_mask': torch.stack([torch.tensor(item['attention_mask']).to(device) for item in batch]),
         'emotion': torch.tensor([{'neutral': 0, 'angry': 1, 'happy': 2, 'frustrated': 3}[item['emotion']] for item in batch]).to(device),
         'fulfilled': torch.tensor([item['fulfilled'] for item in batch], dtype=torch.float).to(device),
@@ -80,29 +112,20 @@ num_epochs = 3
 for epoch in range(num_epochs):
     model.train()
     total_loss = 0
-    
     for batch in train_loader:
         optimizer.zero_grad()
-        
-        # 前向传播
-        outputs = model(input_ids=batch['input_ids'].to(device), attention_mask=batch['attention_mask'].to(device))
-        logits = outputs.logits
-        emotion_logits = logits[:, :4]
-        fulfilled_logits = logits[:, 4]
-        type_logits = logits[:, 5:16]
-        
+        emotion_logits, fulfilled_logits, type_logits = model(
+            input_ids=batch['input_ids'],
+            attention_mask=batch['attention_mask']
+        )
         # 多任务损失计算
         emotion_loss = emotion_loss_fn(emotion_logits, batch['emotion'])
         fulfilled_loss = fulfilled_loss_fn(fulfilled_logits, batch['fulfilled'].float())
         type_loss = type_loss_fn(type_logits, batch['type'])
-        
         loss = emotion_loss + fulfilled_loss + type_loss
-        
         # 反向传播
         loss.backward()
         optimizer.step()
-        
         total_loss += loss.item()
-    
     avg_loss = total_loss / len(train_loader)
     print(f'Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}')
